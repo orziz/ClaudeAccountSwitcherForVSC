@@ -1,50 +1,74 @@
-Claude 多账号 · 环境启动台 —— 使用说明
+Claude 多账号工具 —— 使用说明（速查）
 ==========================================
+完整文档见 README.zh-CN.md（中文）/ README.md（English）。
 
 它解决什么
 ----------
-让你同时开多个 VSCode 窗口，每个窗口登不同的 Claude 账号，并行跑、互不影响。
-适合：不同项目用不同账号（工作 / 外包 / 开源 / 个人……）。
+一台机器同时用多个 Claude 账号，每个跑在独立 VS Code 窗口，并行、互不影响，
+免反复登出登入。适合不同项目用不同账号（工作 / 外包 / 开源 / 个人）。
 
-核心概念
+两个工具
 --------
-“环境” = 一个独立账号的一套独立配置（CLAUDE_CONFIG_DIR，自带各自的登录态）
-        + 一套独立的 VSCode 数据（--user-data-dir，逼出独立进程，环境变量才隔离得开）。
-选中环境点“打开窗口”→ 启动一个绑定该账号的独立 VSCode 实例。
-多个环境可同时开着，各用各的号、各管各的额度，谁也不覆盖谁。
+环境启动台：每个「环境」= 独立 CLAUDE_CONFIG_DIR（各自登录态）+ 独立 VS Code
+            用户数据目录。可同时开多个，各用各号、各管各的额度。  ← 想并行用这个
+单窗口切号：原地切换「默认」登录的那个账号，一个窗口换着登。      ← 想单窗口用这个
 
-============================ Windows ============================
-打开：双击桌面“Claude 多账号启动台”，或双击 launch.vbs。
-绿色可携带：整个文件夹拷到哪都能跑（路径自动探测）。
-
-新建环境：点“新建环境...”→ 起名 → 选默认项目目录(可跳过) → 选绑定方式：
-  - 现场登录        ：开窗后 /login 一次，永久记住
-  - 用当前登录的号  ：把当前默认登录的号直接灌进去，免再登
-  - 从已存账号档灌入：复用旧切号工具存过的快照
-日常：选中环境 →“打开窗口”。● = 已登录，○ = 未登录。
-“单窗口切号(旧)”按钮 = 打开旧的文件交换式切号工具（二合一入口）。
+凭据存哪（重要）
+----------------
+macOS：登录令牌在「钥匙串」(Claude Code-credentials)，不是文件。
+Windows/Linux：令牌是文件 ~/.claude/.credentials.json。
+两个工具都已分别适配。
 
 ============================ macOS =============================
-首次：终端里 cd 到本文件夹，执行  chmod +x claude-env-launcher.command
-打开：双击 claude-env-launcher.command（会弹原生对话框，零安装）。
-读 JSON 用系统自带 plutil，弹窗用 osascript，不装任何东西。
-若提示找不到 code：在 VSCode 里运行
-  “Shell Command: Install 'code' command in PATH” 一次即可。
+首次：终端 cd 到本文件夹，执行
+  chmod +x claude-env-launcher.command claude-switch.command
 
-跨机器携带建议
---------------
-拷“脚本”过去即可；环境(envs)建议在每台机器各自新建。
-凭据 JSON 跨系统通用，但 vscode-userdata 是各系统自己的，别跨系统混用。
+启动台 claude-env-launcher.command（双击）：
+  新建环境 → 起名 → 选默认项目(可跳过) → 选绑定方式：
+    - 现场登录        ：开窗后 /login 一次（推荐，最安全）
+    - 用当前登录的号  ：把当前默认账号直接灌入
+    - 从账号档灌入    ：复用已存快照
+  ● = 已登录，○ = 未登录。
+  「保存当前账号为账号档」：把当前登录快照下来，供以后新建环境时灌入。
+
+切号 claude-switch.command（双击）：
+  原地切换默认账号。切换会改写钥匙串，需「重启 claude / 新开 VS Code 窗口」才
+  生效；已开着的会话不受影响。首次访问可能弹一次「允许访问」，点允许即可。
+  切换前会自动把当前账号备份到 profiles/_切换前自动备份。
+
+若被 Gatekeeper 拦截（“Apple 无法验证…”）：不是病毒，是下载文件的隔离标记。
+  解除：xattr -d com.apple.quarantine claude-env-launcher.command
+找不到 code 命令：VS Code 里运行一次
+  “Shell Command: Install 'code' command in PATH”。
+
+============================ Windows ============================
+双击桌面“Claude 多账号启动台”或 launch.vbs。绿色可携带，路径自动探测。
+ClaudeEnvLauncher.ps1 = 启动台；claude-switch.ps1 = 单窗口切号。
+
+合规
+----
+只用官方机制（CLAUDE_CONFIG_DIR、钥匙串、code 命令、OAuth /login），不破解不绕过。
+合规前提：每个账号都是你合法拥有/被授权、各自独立付费的。这样用就没问题。
+不要用来叠加免费额度 / 绕单订阅限制 / 共享转卖账号。以 Anthropic 当前条款为准。
+
+安全（务必）
+------------
+envs/ profiles/ backups/ 里是各账号的登录令牌，请当密码看待：
+  - 账号档可「加密保存」(推荐)：设口令后令牌存成 credentials.json.enc，不留明文；
+    AES-256 + PBKDF2-SHA256，mac 与 Windows 互通可互解。口令丢了无法恢复，务必记牢。
+  - 「正在用的环境」envs/<名>/.credentials.json 始终是明文——这是隔离机制的固有代价
+    （CLAUDE_CONFIG_DIR 读凭据文件，Win/mac 都一样）。加密保护的是账号档，不是运行环境。
+  - 脚本已设 umask 077，新建文件/目录仅本人可读。
+  - 已被 .gitignore 忽略，永远别提交；别同步到网盘；别拷给别人或别的机器。
+  - 想少留副本：优先“现场登录”，要存账号档就加密存。
+  - 令牌泄漏 = 账号被接管；万一泄漏，重新 /login 一次让旧令牌失效。
 
 文件清单
 --------
-ClaudeEnvLauncher.ps1        Windows 启动台（桌面图标指向它）
-claude-env-launcher.command  macOS 启动台
-claude-switch.ps1            旧“单窗口切号”工具（保留备用）
+claude-env-launcher.command  macOS 环境启动台
+claude-switch.command        macOS 单窗口切号
+ClaudeEnvLauncher.ps1        Windows 环境启动台
+claude-switch.ps1            Windows 单窗口切号
 launch.vbs                   Windows 静默启动器
-envs\<环境名>\               每个环境一套（含登录令牌，敏感！勿外传、勿提交 git）
-
-注意
-----
-- 每个环境是独立 VSCode 实例，首次打开是“干净”界面（默认设置、默认主题）。
-- envs 里存的是各账号的登录令牌，请按敏感数据对待。
+envs/<环境名>/               每个环境一套（含登录令牌，敏感！已 git 忽略）
+profiles/<名>/               已存账号快照（含登录令牌，敏感！已 git 忽略）

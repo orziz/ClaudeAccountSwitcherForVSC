@@ -56,6 +56,45 @@ function Get-EmailFromOAuthText($t) {
 }
 function New-SeedClaudeJson($oauthText) { return "{`n  `"oauthAccount`": $oauthText`n}" }
 
+# ---------------- 账号档加密（AES-256-CBC / PBKDF2-SHA256，与 openssl Salted__ / mac 端一致）----------------
+function Protect-Cred([string]$plain, [string]$pass) {
+    $salt = New-Object byte[] 8
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($salt)
+    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($pass, $salt, 200000, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+    $keyiv = $kdf.GetBytes(48)
+    $aes = [System.Security.Cryptography.Aes]::Create()
+    $aes.KeySize = 256; $aes.BlockSize = 128
+    $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+    $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+    $aes.Key = [byte[]]($keyiv[0..31]); $aes.IV = [byte[]]($keyiv[32..47])
+    $pt = [System.Text.Encoding]::UTF8.GetBytes($plain)
+    $ct = $aes.CreateEncryptor().TransformFinalBlock($pt, 0, $pt.Length)
+    $aes.Dispose()
+    $ms = New-Object System.IO.MemoryStream
+    $ms.Write([System.Text.Encoding]::ASCII.GetBytes('Salted__'), 0, 8); $ms.Write($salt, 0, 8); $ms.Write($ct, 0, $ct.Length)
+    return $ms.ToArray()
+}
+function Unprotect-Cred([byte[]]$blob, [string]$pass) {
+    try {
+        if ($blob.Length -lt 16) { return $null }
+        if ([System.Text.Encoding]::ASCII.GetString($blob, 0, 8) -ne 'Salted__') { return $null }
+        $salt = [byte[]]($blob[8..15]); $ct = [byte[]]($blob[16..($blob.Length - 1)])
+        $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($pass, $salt, 200000, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+        $keyiv = $kdf.GetBytes(48)
+        $aes = [System.Security.Cryptography.Aes]::Create()
+        $aes.KeySize = 256; $aes.BlockSize = 128
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $aes.Key = [byte[]]($keyiv[0..31]); $aes.IV = [byte[]]($keyiv[32..47])
+        $pt = $aes.CreateDecryptor().TransformFinalBlock($ct, 0, $ct.Length)
+        $aes.Dispose()
+        return [System.Text.Encoding]::UTF8.GetString($pt)
+    } catch { return $null }
+}
+function Test-CredText([string]$t) {
+    return ($t -and $t.StartsWith('{') -and $t.Contains('claudeAiOauth') -and $t.Contains('accessToken'))
+}
+
 # ---------------- 环境 / 账号档 ----------------
 function Get-EnvEmail($envDir) {
     $cj = Join-Path $envDir '.claude.json'
@@ -83,7 +122,8 @@ function Get-Profiles {
         $email = '?'
         $meta = Join-Path $_.FullName 'meta.json'
         if (Test-Path $meta) { try { $email = (Get-Content $meta -Raw | ConvertFrom-Json).email } catch {} }
-        [pscustomobject]@{ Name = $_.Name; Email = $email; Dir = $_.FullName }
+        $encd = Test-Path (Join-Path $_.FullName 'credentials.json.enc')
+        [pscustomobject]@{ Name = $_.Name; Email = $email; Dir = $_.FullName; Encrypted = $encd }
     }
 }
 
@@ -112,7 +152,7 @@ function Seed-VSCodeSettings($uddDir) {
     catch {}
 }
 
-function New-Env($name, $defaultProject, $bindMode, $sourceDir) {
+function New-Env($name, $defaultProject, $bindMode, $sourceDir, $pass) {
     $envDir = Join-Path $script:EnvsDir $name
     if (Test-Path $envDir) { throw "环境【$name】已存在。" }
     New-Item -ItemType Directory -Force (Join-Path $envDir 'vscode-userdata') | Out-Null
@@ -122,7 +162,18 @@ function New-Env($name, $defaultProject, $bindMode, $sourceDir) {
             ConvertTo-Json | Set-Content (Join-Path $envDir 'env-meta.json') -Encoding UTF8
         switch ($bindMode) {
             'current' { Seed-Env $envDir $script:HomeCred (Get-OAuthText $script:HomeClaudeJson) }
-            'profile' { Seed-Env $envDir (Join-Path $sourceDir 'credentials.json') (Read-TextFile (Join-Path $sourceDir 'oauthAccount.json')) }
+            'profile' {
+                $encf = Join-Path $sourceDir 'credentials.json.enc'
+                $oauthText = Read-TextFile (Join-Path $sourceDir 'oauthAccount.json')
+                if (Test-Path $encf) {                       # 加密账号档：解密后写入
+                    if (-not $oauthText) { throw '源账号缺少身份信息（oauthAccount）。' }
+                    $credText = Unprotect-Cred ([System.IO.File]::ReadAllBytes($encf)) $pass
+                    if (-not (Test-CredText $credText)) { throw '口令错误或解密失败。' }
+                    Write-TextFile (Join-Path $envDir '.credentials.json') $credText
+                    Write-TextFile (Join-Path $envDir '.claude.json') (New-SeedClaudeJson $oauthText)
+                }
+                else { Seed-Env $envDir (Join-Path $sourceDir 'credentials.json') $oauthText }
+            }
             default   { } # 'login' —— 留空，开窗后自己登
         }
     }
@@ -203,16 +254,31 @@ if ($SelfTest) {
     $ok3 = ($p3.oauthAccount.emailAddress -eq 'personal@y.com') -and
            (Test-Path (Join-Path $script:EnvsDir 'e-profile\.credentials.json'))
 
+    # 3b) profile 模式 · 加密账号档（解密灌入 + 错口令应失败 + 不留明文）
+    $pdir2 = Join-Path $script:ProfilesDir 'p2'
+    New-Item -ItemType Directory -Force $pdir2 | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $pdir2 'credentials.json.enc'), (Protect-Cred '{"claudeAiOauth":{"accessToken":"TOKENC"}}' 'pw123'))
+    Write-TextFile (Join-Path $pdir2 'oauthAccount.json') '{"emailAddress":"enc@z.com","organizationName":"Z"}'
+    '{"email":"enc@z.com"}' | Set-Content (Join-Path $pdir2 'meta.json') -Encoding UTF8
+    New-Env 'e-profenc' '' 'profile' $pdir2 'pw123' | Out-Null
+    $peCred = Read-TextFile (Join-Path $script:EnvsDir 'e-profenc\.credentials.json')
+    $peClaude = Read-TextFile (Join-Path $script:EnvsDir 'e-profenc\.claude.json') | ConvertFrom-Json
+    $wrongFailed = $false
+    try { New-Env 'e-wrongpw' '' 'profile' $pdir2 'BADpw' | Out-Null } catch { $wrongFailed = $true }
+    $ok5 = ($peCred -match 'TOKENC') -and ($peClaude.oauthAccount.emailAddress -eq 'enc@z.com') -and
+           $wrongFailed -and (-not (Test-Path (Join-Path $pdir2 'credentials.json'))) -and
+           (-not (Test-Path (Join-Path $script:EnvsDir 'e-wrongpw')))
+
     # 4) Get-Envs 回读
     $envs = Get-Envs
-    $ok4 = ($envs.Count -eq 3) -and
+    $ok4 = ($envs.Count -eq 4) -and
            (($envs | Where-Object { $_.Name -eq 'e-current' }).Email -eq 'work@x.com') -and
            (($envs | Where-Object { $_.Name -eq 'e-current' }).DefaultProject -eq 'E:\proj\a') -and
            (-not ($envs | Where-Object { $_.Name -eq 'e-login' }).LoggedIn) -and
            (($envs | Where-Object { $_.Name -eq 'e-profile' }).LoggedIn)
 
-    if ($ok1 -and $ok2 -and $ok3 -and $ok4) { Write-Host 'SELFTEST PASS' }
-    else { Write-Host "SELFTEST FAIL  ok1=$ok1 ok2=$ok2 ok3=$ok3 ok4=$ok4" }
+    if ($ok1 -and $ok2 -and $ok3 -and $ok4 -and $ok5) { Write-Host 'SELFTEST PASS' }
+    else { Write-Host "SELFTEST FAIL  ok1=$ok1 ok2=$ok2 ok3=$ok3 ok4=$ok4 ok5=$ok5" }
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     return
 }
@@ -226,6 +292,26 @@ Add-Type -AssemblyName System.Drawing
 function Show-InputBox($prompt, $title, $default) {
     Add-Type -AssemblyName Microsoft.VisualBasic
     return [Microsoft.VisualBasic.Interaction]::InputBox($prompt, $title, $default)
+}
+function Show-PasswordBox($prompt, $title) {  # 掩码输入框；取消返回 $null
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = $title; $f.Size = New-Object System.Drawing.Size(380, 168)
+    $f.StartPosition = 'CenterScreen'; $f.FormBorderStyle = 'FixedDialog'
+    $f.MaximizeBox = $false; $f.MinimizeBox = $false
+    $f.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $lb = New-Object System.Windows.Forms.Label
+    $lb.Location = New-Object System.Drawing.Point(14, 14); $lb.Size = New-Object System.Drawing.Size(345, 40); $lb.Text = $prompt
+    $f.Controls.Add($lb)
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.Location = New-Object System.Drawing.Point(14, 60); $tb.Size = New-Object System.Drawing.Size(345, 26)
+    $tb.UseSystemPasswordChar = $true; $f.Controls.Add($tb)
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Location = New-Object System.Drawing.Point(190, 96); $ok.Size = New-Object System.Drawing.Size(80, 30); $ok.Text = '确定'
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK; $f.Controls.Add($ok); $f.AcceptButton = $ok
+    $cc = New-Object System.Windows.Forms.Button
+    $cc.Location = New-Object System.Drawing.Point(279, 96); $cc.Size = New-Object System.Drawing.Size(80, 30); $cc.Text = '取消'
+    $cc.DialogResult = [System.Windows.Forms.DialogResult]::Cancel; $f.Controls.Add($cc); $f.CancelButton = $cc
+    if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { return $tb.Text } else { return $null }
 }
 function Sanitize-Name($n) { return (($n -replace '[\\/:*?"<>|]', '_').Trim()) }
 
@@ -376,11 +462,16 @@ $btnNew.Add_Click({
                 $profs = Get-Profiles
                 if (-not $profs.Count) { [void][System.Windows.Forms.MessageBox]::Show('还没有已存账号档（可用旧的切号工具「保存当前为新账号」先存）。本次改用现场登录。'); New-Env $name $proj 'login' $null | Out-Null }
                 else {
-                    $pick = Show-ListPick '选要灌入的账号档' ($profs | ForEach-Object { "$($_.Name)  〔$($_.Email)〕" })
+                    $pick = Show-ListPick '选要灌入的账号档' ($profs | ForEach-Object { "$($_.Name)  〔$($_.Email)〕$(if ($_.Encrypted) { '  [加密]' })" })
                     if (-not $pick) { return }
                     $pname = ($pick -split '  〔')[0]
-                    $pdir = ($profs | Where-Object { $_.Name -eq $pname }).Dir
-                    New-Env $name $proj 'profile' $pdir | Out-Null
+                    $sel = $profs | Where-Object { $_.Name -eq $pname } | Select-Object -First 1
+                    $ppass = $null
+                    if ($sel.Encrypted) {
+                        $ppass = Show-PasswordBox "账号档 [$pname] 已加密，输入口令解锁：" '解锁'
+                        if ([string]::IsNullOrEmpty($ppass)) { return }
+                    }
+                    New-Env $name $proj 'profile' $sel.Dir $ppass | Out-Null
                 }
             }
             default { return }

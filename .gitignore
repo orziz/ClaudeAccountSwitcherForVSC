@@ -1,2 +1,8 @@
+# 含各账号的登录令牌 / OAuth 凭据，属敏感数据，绝不能提交
 envs/
 profiles/
+backups/
+
+# 脚本备份与系统杂物
+*.bak
+.DS_Store

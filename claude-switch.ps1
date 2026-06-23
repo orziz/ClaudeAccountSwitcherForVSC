@@ -87,6 +87,48 @@ function Get-EmailFromOAuthText($t) {
     try { return ($t | ConvertFrom-Json).emailAddress } catch { return $null }
 }
 
+# ---------------- 账号档加密（AES-256-CBC / PBKDF2-SHA256，与 openssl Salted__ 格式一致，跨平台可互解）----------------
+# 需 .NET 4.7.2+（Win10 自带）。密文布局： "Salted__"(8) + salt(8) + AES-CBC密文。
+function Protect-Cred([string]$plain, [string]$pass) {
+    $salt = New-Object byte[] 8
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($salt)
+    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($pass, $salt, 200000, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+    $keyiv = $kdf.GetBytes(48)
+    $aes = [System.Security.Cryptography.Aes]::Create()
+    $aes.KeySize = 256; $aes.BlockSize = 128
+    $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+    $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+    $aes.Key = [byte[]]($keyiv[0..31]); $aes.IV = [byte[]]($keyiv[32..47])
+    $pt = [System.Text.Encoding]::UTF8.GetBytes($plain)
+    $ct = $aes.CreateEncryptor().TransformFinalBlock($pt, 0, $pt.Length)
+    $aes.Dispose()
+    $ms = New-Object System.IO.MemoryStream
+    $magic = [System.Text.Encoding]::ASCII.GetBytes('Salted__')
+    $ms.Write($magic, 0, 8); $ms.Write($salt, 0, 8); $ms.Write($ct, 0, $ct.Length)
+    return $ms.ToArray()
+}
+function Unprotect-Cred([byte[]]$blob, [string]$pass) {
+    try {
+        if ($blob.Length -lt 16) { return $null }
+        if ([System.Text.Encoding]::ASCII.GetString($blob, 0, 8) -ne 'Salted__') { return $null }
+        $salt = [byte[]]($blob[8..15])
+        $ct = [byte[]]($blob[16..($blob.Length - 1)])
+        $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($pass, $salt, 200000, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+        $keyiv = $kdf.GetBytes(48)
+        $aes = [System.Security.Cryptography.Aes]::Create()
+        $aes.KeySize = 256; $aes.BlockSize = 128
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $aes.Key = [byte[]]($keyiv[0..31]); $aes.IV = [byte[]]($keyiv[32..47])
+        $pt = $aes.CreateDecryptor().TransformFinalBlock($ct, 0, $ct.Length)
+        $aes.Dispose()
+        return [System.Text.Encoding]::UTF8.GetString($pt)
+    } catch { return $null }
+}
+function Test-CredText([string]$t) {  # 错口令可能解出垃圾（padding 偶然合法），故必须查内容
+    return ($t -and $t.StartsWith('{') -and $t.Contains('claudeAiOauth') -and $t.Contains('accessToken'))
+}
+
 # ---------------- 账号档(profile) ----------------
 function Get-Profiles {
     if (-not (Test-Path $script:ProfilesDir)) { return @() }
@@ -96,26 +138,37 @@ function Get-Profiles {
         if (Test-Path $meta) {
             try { $m = Get-Content $meta -Raw | ConvertFrom-Json; $email = $m.email; $saved = $m.savedAt } catch {}
         }
-        [pscustomobject]@{ Name = $_.Name; Email = $email; SavedAt = $saved; Dir = $_.FullName }
+        $encd = Test-Path (Join-Path $_.FullName 'credentials.json.enc')
+        [pscustomobject]@{ Name = $_.Name; Email = $email; SavedAt = $saved; Dir = $_.FullName; Encrypted = $encd }
     }
 }
 
-function Save-ProfileSnapshot($name, $dir) {
-    # 把“当前登录态”写进指定 profile 目录
+function Save-ProfileSnapshot($name, $dir, $pass) {
+    # 把“当前登录态”写进指定 profile 目录；给了 $pass 则加密令牌(不留明文)
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     if (-not (Test-Path $script:CredPath)) { throw '找不到 .credentials.json，当前可能未登录。' }
     $oauth = Get-CurrentOAuthText
     if (-not $oauth) { throw '当前 .claude.json 中找不到登录信息（oauthAccount），可能未登录。' }
-    Copy-Item $script:CredPath (Join-Path $dir 'credentials.json') -Force
+    $credFile = Join-Path $dir 'credentials.json'
+    $encFile = Join-Path $dir 'credentials.json.enc'
+    if ($pass) {
+        $blob = Protect-Cred (Read-TextFile $script:CredPath) $pass
+        [System.IO.File]::WriteAllBytes($encFile, $blob)
+        Remove-Item $credFile -ErrorAction SilentlyContinue
+    }
+    else {
+        Copy-Item $script:CredPath $credFile -Force
+        Remove-Item $encFile -ErrorAction SilentlyContinue
+    }
     Write-TextFile (Join-Path $dir 'oauthAccount.json') $oauth
     $email = Get-EmailFromOAuthText $oauth
-    @{ email = $email; savedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') } |
+    @{ email = $email; savedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); encrypted = [bool]$pass } |
         ConvertTo-Json | Set-Content (Join-Path $dir 'meta.json') -Encoding UTF8
     return $email
 }
 
-function Save-Profile($name) {
-    return (Save-ProfileSnapshot $name (Join-Path $script:ProfilesDir $name))
+function Save-Profile($name, $pass) {
+    return (Save-ProfileSnapshot $name (Join-Path $script:ProfilesDir $name) $pass)
 }
 
 function Backup-Current {
@@ -129,24 +182,35 @@ function Backup-Current {
     return $dir
 }
 
-function Switch-To($name) {
+function Switch-To($name, $pass) {
     $target = Join-Path $script:ProfilesDir $name
     $tCred = Join-Path $target 'credentials.json'
+    $tCredEnc = Join-Path $target 'credentials.json.enc'
     $tOauth = Join-Path $target 'oauthAccount.json'
-    if (-not (Test-Path $tCred) -or -not (Test-Path $tOauth)) { throw "账号档 '$name' 不完整。" }
+    if (-not (Test-Path $tOauth)) { throw "账号档 '$name' 不完整。" }
 
-    # 切走前先把“当前账号”的最新令牌回存到它自己的档（refreshToken 会轮换，防止快照过期）
+    # 取目标令牌文本（加密档需口令；错口令解出的垃圾用 Test-CredText 拦下）
+    $credText = $null
+    if (Test-Path $tCredEnc) {
+        if (-not $pass) { throw '账号档已加密，需要口令。' }
+        $credText = Unprotect-Cred ([System.IO.File]::ReadAllBytes($tCredEnc)) $pass
+        if (-not (Test-CredText $credText)) { throw '口令错误或解密失败。' }
+    }
+    elseif (Test-Path $tCred) { $credText = Read-TextFile $tCred }
+    else { throw "账号档 '$name' 不完整。" }
+
+    # 切走前把“当前账号”的最新令牌回存到它自己的档（refreshToken 会轮换）；加密档跳过以免要口令
     $curOauth = Get-CurrentOAuthText
     if ($curOauth) {
         $curEmail = Get-EmailFromOAuthText $curOauth
         $match = Get-Profiles | Where-Object { $_.Email -eq $curEmail } | Select-Object -First 1
-        if ($match -and $match.Name -ne $name) {
+        if ($match -and $match.Name -ne $name -and -not $match.Encrypted) {
             try { Save-ProfileSnapshot $match.Name $match.Dir | Out-Null } catch {}
         }
     }
 
     Backup-Current | Out-Null
-    Copy-Item $tCred $script:CredPath -Force
+    Write-TextFile $script:CredPath $credText
     Set-OAuthInClaudeJson (Read-TextFile $tOauth)
 }
 
@@ -189,14 +253,28 @@ if ($SelfTest) {
     $parsed = (Read-TextFile $script:ClaudeJson) | ConvertFrom-Json
     $cred = Read-TextFile $script:CredPath
 
+    # 加密账号档往返：存为加密档 C → 验证无明文、正确口令可解、错口令被拦、切换生效
+    Write-TextFile $script:CredPath '{"claudeAiOauth":{"accessToken":"TOKEN_ENC"}}'
+    $eC = Save-Profile 'C' 'pw-correct'
+    $cDir = Join-Path $script:ProfilesDir 'C'
+    $encExists = Test-Path (Join-Path $cDir 'credentials.json.enc')
+    $plainGone = -not (Test-Path (Join-Path $cDir 'credentials.json'))
+    $blobC = [System.IO.File]::ReadAllBytes((Join-Path $cDir 'credentials.json.enc'))
+    $decOK = Unprotect-Cred $blobC 'pw-correct'
+    $decBad = Unprotect-Cred $blobC 'pw-wrong'
+    $encOK = ($encExists -and $plainGone -and (Test-CredText $decOK) -and ($decOK -match 'TOKEN_ENC') -and (-not (Test-CredText $decBad)))
+    Switch-To 'C' 'pw-correct'
+    $encSwitchOK = ((Read-TextFile $script:CredPath) -match 'TOKEN_ENC')
+
     $ok = ($eA -eq 'a@example.com') -and ($eB -eq 'b@example.com') -and
           ($parsed.oauthAccount.emailAddress -eq 'a@example.com') -and
           ($parsed.oauthAccount.orgRaw -eq 'brace } and { here') -and
           ($parsed.userID -eq 'keepme') -and ($parsed.machineID -eq 'stable') -and
-          ($parsed.projects.a.nested.deep -eq 'x') -and ($cred -match 'TOKEN_A')
+          ($parsed.projects.a.nested.deep -eq 'x') -and ($cred -match 'TOKEN_A') -and
+          $encOK -and $encSwitchOK
     if ($ok) { Write-Host 'SELFTEST PASS' }
     else {
-        Write-Host "SELFTEST FAIL email=$($parsed.oauthAccount.emailAddress) orgRaw=$($parsed.oauthAccount.orgRaw) userID=$($parsed.userID) machineID=$($parsed.machineID) deep=$($parsed.projects.a.nested.deep) credA=$($cred -match 'TOKEN_A')"
+        Write-Host "SELFTEST FAIL email=$($parsed.oauthAccount.emailAddress) orgRaw=$($parsed.oauthAccount.orgRaw) userID=$($parsed.userID) machineID=$($parsed.machineID) deep=$($parsed.projects.a.nested.deep) credA=$($cred -match 'TOKEN_A') encOK=$encOK encSwitch=$encSwitchOK"
     }
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
     return
@@ -213,6 +291,27 @@ Add-Type -AssemblyName System.Drawing
 function Show-InputBox($prompt, $title, $default) {
     Add-Type -AssemblyName Microsoft.VisualBasic
     return [Microsoft.VisualBasic.Interaction]::InputBox($prompt, $title, $default)
+}
+
+function Show-PasswordBox($prompt, $title) {  # 掩码输入框；取消返回 $null
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = $title; $f.Size = New-Object System.Drawing.Size(380, 168)
+    $f.StartPosition = 'CenterScreen'; $f.FormBorderStyle = 'FixedDialog'
+    $f.MaximizeBox = $false; $f.MinimizeBox = $false
+    $f.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $lb = New-Object System.Windows.Forms.Label
+    $lb.Location = New-Object System.Drawing.Point(14, 14); $lb.Size = New-Object System.Drawing.Size(345, 40); $lb.Text = $prompt
+    $f.Controls.Add($lb)
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.Location = New-Object System.Drawing.Point(14, 60); $tb.Size = New-Object System.Drawing.Size(345, 26)
+    $tb.UseSystemPasswordChar = $true; $f.Controls.Add($tb)
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Location = New-Object System.Drawing.Point(190, 96); $ok.Size = New-Object System.Drawing.Size(80, 30); $ok.Text = '确定'
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK; $f.Controls.Add($ok); $f.AcceptButton = $ok
+    $cc = New-Object System.Windows.Forms.Button
+    $cc.Location = New-Object System.Drawing.Point(279, 96); $cc.Size = New-Object System.Drawing.Size(80, 30); $cc.Text = '取消'
+    $cc.DialogResult = [System.Windows.Forms.DialogResult]::Cancel; $f.Controls.Add($cc); $f.CancelButton = $cc
+    if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { return $tb.Text } else { return $null }
 }
 
 function Sanitize-Name($n) { return (($n -replace '[\\/:*?"<>|]', '_').Trim()) }
@@ -235,7 +334,7 @@ $lblHint = New-Object System.Windows.Forms.Label
 $lblHint.Location = New-Object System.Drawing.Point(14, 40)
 $lblHint.Size = New-Object System.Drawing.Size(400, 18)
 $lblHint.ForeColor = [System.Drawing.Color]::Gray
-$lblHint.Text = '● 标记为当前登录账号 · 选中后点“切换到选中账号”'
+$lblHint.Text = '● 当前账号 · [密] 已加密 · 选中后点“切换到选中账号”'
 $form.Controls.Add($lblHint)
 
 $listBox = New-Object System.Windows.Forms.ListBox
@@ -285,7 +384,8 @@ function Refresh-UI {
     $script:ProfileNames = @()
     foreach ($p in (Get-Profiles)) {
         $mark = if ($p.Email -eq $cur) { '●' } else { ' ' }
-        [void]$listBox.Items.Add(('{0} {1,-10} {2,-26} {3}' -f $mark, $p.Name, $p.Email, $p.SavedAt))
+        $enc = if ($p.Encrypted) { '[密]' } else { '   ' }
+        [void]$listBox.Items.Add(('{0}{1} {2,-10} {3,-26} {4}' -f $mark, $enc, $p.Name, $p.Email, $p.SavedAt))
         $script:ProfileNames += $p.Name
     }
     $lblStatus.Text = "共 $($script:ProfileNames.Count) 个账号档"
@@ -302,7 +402,13 @@ $btnSwitch.Add_Click({
         [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
     if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
     try {
-        Switch-To $name
+        $pass = $null
+        $prof = Get-Profiles | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+        if ($prof -and $prof.Encrypted) {
+            $pass = Show-PasswordBox "账号档 [$name] 已加密，输入口令解锁：" '解锁'
+            if ([string]::IsNullOrEmpty($pass)) { return }
+        }
+        Switch-To $name $pass
         Refresh-UI
         [void][System.Windows.Forms.MessageBox]::Show("已切换到 [$name]。`n请重新打开 Claude Code 会话以生效。", '完成')
     }
@@ -314,8 +420,17 @@ $btnSave.Add_Click({
     $def = if ($cur) { ($cur -split '@')[0] } else { '账号1' }
     $name = Sanitize-Name (Show-InputBox '给当前登录的账号起个名字（如 工作 / 私人）：' '保存账号档' $def)
     if ([string]::IsNullOrWhiteSpace($name)) { return }
+    $pass = $null
+    $re = [System.Windows.Forms.MessageBox]::Show("是否加密保存此账号档？`n（加密=令牌不留明文，每次使用需输口令）", '加密',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($re -eq [System.Windows.Forms.DialogResult]::Yes) {
+        $pass = Show-PasswordBox '设置加密口令（务必记住，丢失则无法恢复）：' '加密口令'
+        if ([string]::IsNullOrEmpty($pass)) { return }
+        $pass2 = Show-PasswordBox '再次输入口令确认：' '加密口令'
+        if ($pass -ne $pass2) { [void][System.Windows.Forms.MessageBox]::Show('两次口令不一致，已取消。', '提示'); return }
+    }
     try {
-        $email = Save-Profile $name
+        $email = Save-Profile $name $pass
         Refresh-UI
         [void][System.Windows.Forms.MessageBox]::Show("已保存：[$name]  $email", '完成')
     }

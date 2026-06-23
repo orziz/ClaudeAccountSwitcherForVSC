@@ -10,6 +10,9 @@
 # 首次使用：chmod +x 本文件，然后双击（或终端运行）。
 # =====================================================================
 
+export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8   # 防无效 locale(如 C.UTF-8) 导致多字节解析错
+umask 077                                     # 新建的令牌文件/目录默认仅本人可读 (600/700)
+
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 ENVS="$ROOT/envs"
 PROFILES="$ROOT/profiles"
@@ -19,23 +22,26 @@ mkdir -p "$ENVS"
 
 # ---------------- osascript 弹窗辅助 ----------------
 msg() {  # 信息框
+  local m="${1//\"/\\\"}"
   osascript >/dev/null 2>&1 <<EOF
-display dialog "${1//\"/\\\"}" buttons {"好"} default button 1
+display dialog "$m" buttons {"好"} default button 1
 EOF
 }
 ask_text() {  # 文本输入，返回内容；取消返回空
+  local p="${1//\"/\\\"}"; local a="${2//\"/\\\"}"
   osascript 2>/dev/null <<EOF
 try
-  return text returned of (display dialog "${1//\"/\\\"}" default answer "${2//\"/\\\"}")
+  return text returned of (display dialog "$p" default answer "$a")
 on error
   return ""
 end try
 EOF
 }
 choose_folder() {  # 选文件夹，返回 POSIX 路径；取消返回空
+  local p="${1//\"/\\\"}"
   osascript 2>/dev/null <<EOF
 try
-  return POSIX path of (choose folder with prompt "${1//\"/\\\"}")
+  return POSIX path of (choose folder with prompt "$p")
 on error
   return ""
 end try
@@ -46,9 +52,10 @@ ask_buttons() {  # 提示 + 最多3个按钮，返回按钮文字；取消返回
   local btns=""; local b
   for b in "$@"; do btns+="\"${b//\"/\\\"}\", "; done
   btns="${btns%, }"
+  local p="${prompt//\"/\\\"}"
   osascript 2>/dev/null <<EOF
 try
-  return button returned of (display dialog "${prompt//\"/\\\"}" buttons {$btns} default button 1)
+  return button returned of (display dialog "$p" buttons {$btns} default button 1)
 on error
   return ""
 end try
@@ -59,8 +66,9 @@ choose_from() {  # 列表单选，返回选中文字；取消返回空
   local items=""; local o
   for o in "$@"; do items+="\"${o//\"/\\\"}\", "; done
   items="${items%, }"
+  local p="${prompt//\"/\\\"}"
   osascript 2>/dev/null <<EOF
-set r to choose from list {$items} with prompt "${prompt//\"/\\\"}"
+set r to choose from list {$items} with prompt "$p"
 if r is false then
   return ""
 else
@@ -80,6 +88,55 @@ env_email() {  # $1=envdir -> 邮箱或空
 }
 env_project() {  # $1=envdir -> 默认项目或空
   plutil -extract defaultProject raw -o - "$1/env-meta.json" 2>/dev/null
+}
+current_cred() {  # 打印当前默认账号的凭据 JSON；mac 令牌在钥匙串，旧系统在文件；空=未登录
+  if [ -f "$HOME_CRED" ]; then cat "$HOME_CRED"; return; fi
+  security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null
+}
+
+# ---------------- 账号档加密（openssl AES-256-CBC / PBKDF2-SHA256，口令保护）----------------
+# 格式与 Windows 端一致（openssl 标准 Salted__），跨平台可互解。
+ask_pass() {  # 隐藏输入的口令框；取消返回空
+  local p="${1//\"/\\\"}"
+  osascript 2>/dev/null <<EOF
+try
+  return text returned of (display dialog "$p" default answer "" with hidden answer)
+on error
+  return ""
+end try
+EOF
+}
+enc_to() {  # $1=明文文件 $2=输出.enc $3=口令
+  openssl enc -aes-256-cbc -pbkdf2 -md sha256 -iter 200000 -salt -pass "pass:$3" -in "$1" -out "$2" 2>/dev/null
+}
+dec_to() {  # $1=.enc $2=输出明文文件 $3=口令
+  openssl enc -d -aes-256-cbc -pbkdf2 -md sha256 -iter 200000 -pass "pass:$3" -in "$1" -out "$2" 2>/dev/null
+}
+valid_cred() {  # 校验解密结果像不像真凭据（错口令可能解出垃圾且 openssl 不报错，故必须查内容）
+  case "$1" in (\{*claudeAiOauth*accessToken*) return 0 ;; esac
+  return 1
+}
+write_profile() {  # $1=pdir $2=cred(JSON) $3=oauth(JSON)；问是否加密；成功0
+  local enc; enc="$(ask_buttons "加密保存此账号档？（加密=令牌不留明文，需设口令）" "加密" "不加密")"
+  [ -z "$enc" ] && return 1
+  local pp=""
+  if [ "$enc" = "加密" ]; then
+    pp="$(ask_pass "设置加密口令（务必记住，丢失则无法恢复）：")"; [ -z "$pp" ] && return 1
+    local pp2; pp2="$(ask_pass "再次输入确认：")"
+    [ "$pp" != "$pp2" ] && { msg "两次口令不一致。"; return 1; }
+  fi
+  if [ -n "$pp" ]; then
+    local tmp tenc; tmp="$(mktemp)"; tenc="$(mktemp)"
+    print -r -- "$2" > "$tmp"
+    enc_to "$tmp" "$tenc" "$pp"; local rc=$?; rm -f "$tmp"
+    [ $rc -ne 0 ] && { rm -f "$tenc"; msg "加密失败。"; return 1; }
+    mkdir -p "$1"; print -r -- "$3" > "$1/oauthAccount.json"
+    rm -f "$1/credentials.json"; mv "$tenc" "$1/credentials.json.enc"; chmod 600 "$1/credentials.json.enc"
+  else
+    mkdir -p "$1"; print -r -- "$3" > "$1/oauthAccount.json"
+    rm -f "$1/credentials.json.enc"; print -r -- "$2" > "$1/credentials.json"; chmod 600 "$1/credentials.json"
+  fi
+  return 0
 }
 
 seed_env() {  # $1=envdir $2=凭据源 $3=oauthAccount(JSON文本)
@@ -103,11 +160,26 @@ create_env() {  # $1=name $2=proj $3=mode(login/current/profile) $4=src
   case "$3" in
     current)
       local oauth; oauth="$(plutil -extract oauthAccount json -o - "$HOME_CLAUDE_JSON" 2>/dev/null)"
-      if [ -z "$oauth" ] || [ ! -f "$HOME_CRED" ]; then rm -rf "$envdir"; msg "当前默认账号未登录，无法灌入。"; return 1; fi
-      seed_env "$envdir" "$HOME_CRED" "$oauth" ;;
+      local cred; cred="$(current_cred)"
+      if [ -z "$oauth" ] || [ -z "$cred" ]; then rm -rf "$envdir"; msg "当前默认账号未登录，无法灌入。"; return 1; fi
+      print -r -- "$cred" > "$envdir/.credentials.json"; chmod 600 "$envdir/.credentials.json"
+      printf '{\n  "oauthAccount": %s\n}\n' "$oauth" > "$envdir/.claude.json" ;;
     profile)
-      if [ ! -f "$4/credentials.json" ]; then rm -rf "$envdir"; msg "账号档不完整。"; return 1; fi
-      seed_env "$envdir" "$4/credentials.json" "$(cat "$4/oauthAccount.json")" ;;
+      local oa; oa="$(cat "$4/oauthAccount.json" 2>/dev/null)"
+      if [ -f "$4/credentials.json.enc" ]; then            # 加密账号档：要口令
+        local pp; pp="$(ask_pass "账号档已加密，输入口令解锁：")"
+        [ -z "$pp" ] && { rm -rf "$envdir"; return 1; }
+        dec_to "$4/credentials.json.enc" "$envdir/.credentials.json" "$pp"
+        if ! valid_cred "$(cat "$envdir/.credentials.json" 2>/dev/null)"; then
+          rm -rf "$envdir"; msg "口令错误或解密失败。"; return 1
+        fi
+        chmod 600 "$envdir/.credentials.json"
+        printf '{\n  "oauthAccount": %s\n}\n' "$oa" > "$envdir/.claude.json"
+      elif [ -f "$4/credentials.json" ]; then              # 未加密账号档
+        seed_env "$envdir" "$4/credentials.json" "$oa"
+      else
+        rm -rf "$envdir"; msg "账号档不完整。"; return 1
+      fi ;;
     *) : ;;  # login：留空，开窗后自己 /login
   esac
 }
@@ -169,6 +241,27 @@ new_env_flow() {
   fi
 }
 
+# ---------------- 保存当前默认账号为账号档 ----------------
+save_profile_flow() {
+  local oauth; oauth="$(plutil -extract oauthAccount json -o - "$HOME_CLAUDE_JSON" 2>/dev/null)"
+  local cred; cred="$(current_cred)"
+  if [ -z "$oauth" ] || [ -z "$cred" ]; then msg "当前默认账号未登录，无可保存。"; return; fi
+  local email; email="$(plutil -extract oauthAccount.emailAddress raw -o - "$HOME_CLAUDE_JSON" 2>/dev/null)"
+  local name; name="$(ask_text "账号档命名（便于辨认）：" "$email")"
+  [ -z "$name" ] && return
+  name="${name//\//_}"
+  local pdir="$PROFILES/$name"
+  if [ -d "$pdir" ]; then
+    local c; c="$(ask_buttons "账号档【$name】已存在，覆盖？" "取消" "覆盖")"
+    [ "$c" != "覆盖" ] && return
+  fi
+  if write_profile "$pdir" "$cred" "$oauth"; then
+    msg "账号档【$name】已保存（$email）。以后新建环境可从它灌入。"
+  else
+    [ ! -e "$pdir/credentials.json" ] && [ ! -e "$pdir/credentials.json.enc" ] && rm -rf "$pdir"
+  fi
+}
+
 # ---------------- 主循环 ----------------
 while true; do
   rows=(); names=(); d=""
@@ -180,10 +273,12 @@ while true; do
     names+=("$n")
   done
   rows+=("➕ 新建环境…")
+  rows+=("💾 保存当前账号为账号档…")
 
   choice="$(choose_from "选环境（确定=进入操作），或新建。●=已登录" "${rows[@]}")"
   [ -z "$choice" ] && exit 0
   if [ "$choice" = "➕ 新建环境…" ]; then new_env_flow; continue; fi
+  if [ "$choice" = "💾 保存当前账号为账号档…" ]; then save_profile_flow; continue; fi
 
   # 把选中行映射回环境名
   sel=""; i=1
