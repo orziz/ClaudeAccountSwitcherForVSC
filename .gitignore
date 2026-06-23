@@ -6,3 +6,6 @@ backups/
 # 脚本备份与系统杂物
 *.bak
 .DS_Store
+
+# 本机遗留/实验脚本（被 GUI 版 ClaudeEnvLauncher.ps1 取代，路径写死不便携）
+parallel/

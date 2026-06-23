@@ -26,6 +26,37 @@ function Write-TextFile($p, $t) {
     [System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# ---------------- 权限收紧（NTFS ACL 收到「仅当前用户」，等价 macOS 的 umask 077；失败不致命）----------------
+function Lock-Private($path) {
+    # 用全新的「只含 DACL」安全描述符覆盖：仅写 DACL（只需 WRITE_DAC，属主自带），
+    # 避免 Set-Acl 回写 SACL/属主导致的 SeSecurityPrivilege 报错。
+    try {
+        if (-not (Test-Path -LiteralPath $path)) { return }
+        $item = Get-Item -LiteralPath $path -Force
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        if ($item.PSIsContainer) {
+            $sec = New-Object System.Security.AccessControl.DirectorySecurity
+            $inh = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        } else {
+            $sec = New-Object System.Security.AccessControl.FileSecurity
+            $inh = [System.Security.AccessControl.InheritanceFlags]::None
+        }
+        $sec.SetAccessRuleProtection($true, $false)   # 断继承 + 不保留继承来的规则
+        $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', $inh, 'None', 'Allow')))
+        $item.SetAccessControl($sec)
+    } catch {}
+}
+function Lock-PrivateData {
+    # 启动时一次性收紧数据目录及其中已有的敏感文件（不动 vscode-userdata 等非敏感内容）
+    $sensitive = '.credentials.json', '.claude.json', 'credentials.json', 'credentials.json.enc', 'oauthAccount.json'
+    foreach ($root in @($script:EnvsDir, $script:ProfilesDir)) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        Lock-Private $root
+        Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue |
+            Where-Object { $sensitive -contains $_.Name } | ForEach-Object { Lock-Private $_.FullName }
+    }
+}
+
 # ---------------- oauthAccount 文本定位（字符串感知的花括号匹配） ----------------
 function Find-MatchingBrace($s, $open) {
     $depth = 0; $inStr = $false; $esc = $false
@@ -181,6 +212,8 @@ function New-Env($name, $defaultProject, $bindMode, $sourceDir, $pass) {
         Remove-Item -LiteralPath $envDir -Recurse -Force -ErrorAction SilentlyContinue  # 失败回滚，避免残留半成品挡重试
         throw
     }
+    Lock-Private $envDir
+    foreach ($f in '.credentials.json', '.claude.json') { Lock-Private (Join-Path $envDir $f) }
     return $envDir
 }
 
@@ -285,6 +318,7 @@ if ($SelfTest) {
 
 # ======================= GUI =======================
 New-Item -ItemType Directory -Force $script:EnvsDir | Out-Null
+Lock-PrivateData
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()

@@ -65,7 +65,7 @@ chmod +x claude-env-launcher.command claude-switch.command   # 仅首次
 
 - **加密账号档（推荐）。** 保存账号档时可设口令加密，令牌存成 `credentials.json.enc`（AES-256-CBC + PBKDF2-HMAC-SHA256 20 万次迭代，openssl `Salted__` 格式，**macOS 与 Windows 互通可互解**）。此时磁盘上**不留明文令牌**，灌入/切换时再输口令。**口令丢了无法恢复，务必记牢。**
 - **正在使用的环境**（`envs/<名>/.credentials.json`）始终是明文——这点**无法避免**：`CLAUDE_CONFIG_DIR` 读的是凭据**文件**、不走钥匙串，是多账号隔离机制的固有代价（Win/mac 都一样）。加密保护的是**账号档快照**，不是运行中的环境。
-- 脚本已设 `umask 077`，新建文件/目录**仅本人可读**（600/700）。
+- **磁盘上仅本人可读。** macOS 下脚本设 `umask 077`（新建文件/目录为 600/700）；Windows 下则把凭据文件/目录（`envs/`、`profiles/`、`backups/` 及 `~/.claude/.credentials.json`）的 NTFS ACL 收紧到**仅当前用户**——去除继承，其它账户（含管理员）一律无权访问。
 - `envs/`、`profiles/`、`backups/` 已被 **git 忽略**——永远不要提交。
 - **不要**同步到 iCloud / OneDrive / 坚果云等网盘，**不要**把文件夹拷给别人或别的机器。
 - 想尽量少留副本：优先**现场登录**，要存账号档就**加密**存。

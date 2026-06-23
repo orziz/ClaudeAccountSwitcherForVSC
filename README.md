@@ -65,7 +65,7 @@ Account login tokens are **sensitive**. Treat the `envs/`, `profiles/` and `back
 
 - **Encrypted profiles (recommended).** When saving a profile you can protect it with a passphrase. The token is then stored as `credentials.json.enc` (AES-256-CBC, PBKDF2-HMAC-SHA256, 200k iterations — openssl `Salted__` format, so a profile encrypts/decrypts interchangeably on macOS and Windows). No plaintext token is written; you enter the passphrase when seeding/switching. **A lost passphrase is unrecoverable.**
 - An **active environment** (`envs/<name>/.credentials.json`) is always plaintext — this is unavoidable: `CLAUDE_CONFIG_DIR` reads a credentials *file*, not the Keychain. So a token file on disk is inherent to the running multi-account model (true on both Windows and macOS). Encryption protects the *saved profiles*, not the live env.
-- The scripts set `umask 077`, so created files/dirs are **owner-only** (600/700).
+- **Owner-only on disk.** On macOS the scripts set `umask 077` (created files/dirs are 600/700). On Windows they tighten the NTFS ACL on the credential files/dirs (`envs/`, `profiles/`, `backups/` and `~/.claude/.credentials.json`) to the **current user only** — inheritance is removed, so other accounts (incl. Administrators) lose access.
 - `envs/`, `profiles/`, `backups/` are **git-ignored** — never commit them.
 - **Do not** sync these folders to iCloud / OneDrive / Dropbox, and **do not** copy the folder to other people or machines.
 - To minimize copies, prefer **Live login** per environment, and encrypt any profile you do save.

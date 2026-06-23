@@ -25,6 +25,38 @@ function Write-TextFile($p, $t) {
     [System.IO.File]::WriteAllText($p, $t, $enc)
 }
 
+# ---------------- 权限收紧（NTFS ACL 收到「仅当前用户」，等价 macOS 的 umask 077；失败不致命）----------------
+function Lock-Private($path) {
+    # 用全新的「只含 DACL」安全描述符覆盖：仅写 DACL（只需 WRITE_DAC，属主自带），
+    # 避免 Set-Acl 回写 SACL/属主导致的 SeSecurityPrivilege 报错。
+    try {
+        if (-not (Test-Path -LiteralPath $path)) { return }
+        $item = Get-Item -LiteralPath $path -Force
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        if ($item.PSIsContainer) {
+            $sec = New-Object System.Security.AccessControl.DirectorySecurity
+            $inh = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        } else {
+            $sec = New-Object System.Security.AccessControl.FileSecurity
+            $inh = [System.Security.AccessControl.InheritanceFlags]::None
+        }
+        $sec.SetAccessRuleProtection($true, $false)   # 断继承 + 不保留继承来的规则
+        $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', $inh, 'None', 'Allow')))
+        $item.SetAccessControl($sec)
+    } catch {}
+}
+function Lock-PrivateData {
+    # 启动时一次性收紧数据目录及其中已有的敏感文件（不动 vscode-userdata 等非敏感内容）
+    $sensitive = '.credentials.json', '.claude.json', 'credentials.json', 'credentials.json.enc', 'oauthAccount.json'
+    foreach ($root in @($script:ProfilesDir, $script:BackupsDir)) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        Lock-Private $root
+        Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue |
+            Where-Object { $sensitive -contains $_.Name } | ForEach-Object { Lock-Private $_.FullName }
+    }
+    if (Test-Path -LiteralPath $script:CredPath) { Lock-Private $script:CredPath }
+}
+
 # ---------------- oauthAccount 文本定位（字符串感知的花括号匹配） ----------------
 function Find-MatchingBrace($s, $open) {
     # $s[$open] 必须是 '{'，返回与之匹配的 '}' 下标；找不到返回 -1
@@ -164,6 +196,8 @@ function Save-ProfileSnapshot($name, $dir, $pass) {
     $email = Get-EmailFromOAuthText $oauth
     @{ email = $email; savedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); encrypted = [bool]$pass } |
         ConvertTo-Json | Set-Content (Join-Path $dir 'meta.json') -Encoding UTF8
+    Lock-Private $dir
+    foreach ($f in 'credentials.json', 'credentials.json.enc', 'oauthAccount.json', 'meta.json') { Lock-Private (Join-Path $dir $f) }
     return $email
 }
 
@@ -177,6 +211,8 @@ function Backup-Current {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     if (Test-Path $script:CredPath) { Copy-Item $script:CredPath (Join-Path $dir '.credentials.json') -Force }
     if (Test-Path $script:ClaudeJson) { Copy-Item $script:ClaudeJson (Join-Path $dir '.claude.json') -Force }
+    Lock-Private $dir
+    foreach ($f in '.credentials.json', '.claude.json') { Lock-Private (Join-Path $dir $f) }
     Get-ChildItem $script:BackupsDir -Directory | Sort-Object Name -Descending |
         Select-Object -Skip 10 | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     return $dir
@@ -211,6 +247,7 @@ function Switch-To($name, $pass) {
 
     Backup-Current | Out-Null
     Write-TextFile $script:CredPath $credText
+    Lock-Private $script:CredPath
     Set-OAuthInClaudeJson (Read-TextFile $tOauth)
 }
 
@@ -283,6 +320,7 @@ if ($SelfTest) {
 # ======================= GUI =======================
 New-Item -ItemType Directory -Force -Path $script:ProfilesDir | Out-Null
 New-Item -ItemType Directory -Force -Path $script:BackupsDir | Out-Null
+Lock-PrivateData
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
