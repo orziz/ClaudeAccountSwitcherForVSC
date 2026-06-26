@@ -218,6 +218,21 @@ function Backup-Current {
     return $dir
 }
 
+function Writeback-Current($excludeName, $outPass) {
+    # 切走前：把当前默认账号的最新令牌回写进它自己的命名档，防止下次切回时令牌已轮换作废而要重登
+    $curEmail = Get-EmailFromOAuthText (Get-CurrentOAuthText)
+    if (-not $curEmail) { return }
+    $prof = Get-Profiles | Where-Object { $_.Email -eq $curEmail -and $_.Name -ne $excludeName } | Select-Object -First 1
+    if (-not $prof) { return }
+    if ($prof.Encrypted) {
+        if ([string]::IsNullOrEmpty($outPass)) { return }   # 没给口令：跳过保鲜（下次切回它可能要重登）
+        Save-ProfileSnapshot $prof.Name $prof.Dir $outPass | Out-Null
+    }
+    else {
+        Save-ProfileSnapshot $prof.Name $prof.Dir | Out-Null
+    }
+}
+
 function Switch-To($name, $pass) {
     $target = Join-Path $script:ProfilesDir $name
     $tCred = Join-Path $target 'credentials.json'
@@ -235,16 +250,7 @@ function Switch-To($name, $pass) {
     elseif (Test-Path $tCred) { $credText = Read-TextFile $tCred }
     else { throw "账号档 '$name' 不完整。" }
 
-    # 切走前把“当前账号”的最新令牌回存到它自己的档（refreshToken 会轮换）；加密档跳过以免要口令
-    $curOauth = Get-CurrentOAuthText
-    if ($curOauth) {
-        $curEmail = Get-EmailFromOAuthText $curOauth
-        $match = Get-Profiles | Where-Object { $_.Email -eq $curEmail } | Select-Object -First 1
-        if ($match -and $match.Name -ne $name -and -not $match.Encrypted) {
-            try { Save-ProfileSnapshot $match.Name $match.Dir | Out-Null } catch {}
-        }
-    }
-
+    # 注：切走前的“保鲜回写”已移到调用方（GUI / 自检），以便加密档能就地索要口令重新加密
     Backup-Current | Out-Null
     Write-TextFile $script:CredPath $credText
     Lock-Private $script:CredPath
@@ -303,15 +309,26 @@ if ($SelfTest) {
     Switch-To 'C' 'pw-correct'
     $encSwitchOK = ((Read-TextFile $script:CredPath) -match 'TOKEN_ENC')
 
+    # 轮换保鲜回归（修复核心）：D 档加密存 T1 → 模拟该账号令牌轮换为 T2 → Writeback-Current 应把 D 档刷新成 T2
+    $sampleD = $sampleJson.Replace('uuid-A', 'uuid-D').Replace('a@example.com', 'd@example.com').Replace('Org A', 'Org D')
+    Write-TextFile $script:ClaudeJson $sampleD
+    Write-TextFile $script:CredPath '{"claudeAiOauth":{"accessToken":"TOKEN_D1"}}'
+    Save-Profile 'D' 'pw-d' | Out-Null
+    Write-TextFile $script:CredPath '{"claudeAiOauth":{"accessToken":"TOKEN_D2"}}'   # 模拟 Claude 轮换了 D 的令牌
+    Writeback-Current 'zzz' 'pw-d'                                                    # 切走 D（excludeName≠D）→ 应刷新 D 档
+    $dEnc = Join-Path (Join-Path $script:ProfilesDir 'D') 'credentials.json.enc'
+    $dDec = Unprotect-Cred ([System.IO.File]::ReadAllBytes($dEnc)) 'pw-d'
+    $rotOK = ($dDec -match 'TOKEN_D2')
+
     $ok = ($eA -eq 'a@example.com') -and ($eB -eq 'b@example.com') -and
           ($parsed.oauthAccount.emailAddress -eq 'a@example.com') -and
           ($parsed.oauthAccount.orgRaw -eq 'brace } and { here') -and
           ($parsed.userID -eq 'keepme') -and ($parsed.machineID -eq 'stable') -and
           ($parsed.projects.a.nested.deep -eq 'x') -and ($cred -match 'TOKEN_A') -and
-          $encOK -and $encSwitchOK
+          $encOK -and $encSwitchOK -and $rotOK
     if ($ok) { Write-Host 'SELFTEST PASS' }
     else {
-        Write-Host "SELFTEST FAIL email=$($parsed.oauthAccount.emailAddress) orgRaw=$($parsed.oauthAccount.orgRaw) userID=$($parsed.userID) machineID=$($parsed.machineID) deep=$($parsed.projects.a.nested.deep) credA=$($cred -match 'TOKEN_A') encOK=$encOK encSwitch=$encSwitchOK"
+        Write-Host "SELFTEST FAIL email=$($parsed.oauthAccount.emailAddress) orgRaw=$($parsed.oauthAccount.orgRaw) userID=$($parsed.userID) machineID=$($parsed.machineID) deep=$($parsed.projects.a.nested.deep) credA=$($cred -match 'TOKEN_A') encOK=$encOK encSwitch=$encSwitchOK rot=$rotOK"
     }
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
     return
@@ -446,6 +463,22 @@ $btnSwitch.Add_Click({
             $pass = Show-PasswordBox "账号档 [$name] 已加密，输入口令解锁：" '解锁'
             if ([string]::IsNullOrEmpty($pass)) { return }
         }
+        # 切走前保鲜当前账号（加密档需其口令；不输则跳过，下次切回它可能要重登）
+        $curEmail = Get-EmailFromOAuthText (Get-CurrentOAuthText)
+        $outProf = if ($curEmail) { Get-Profiles | Where-Object { $_.Email -eq $curEmail -and $_.Name -ne $name } | Select-Object -First 1 } else { $null }
+        $outPass = $null
+        if ($outProf -and $outProf.Encrypted) {
+            $outPass = Show-PasswordBox "为保鲜当前账号 [$curEmail]，输入它账号档的口令。`n（取消=跳过；跳过则下次切回它可能要重新登录）" '保鲜当前账号'
+            if ([string]::IsNullOrEmpty($outPass)) { $outProf = $null }
+            else {
+                $chk = Unprotect-Cred ([System.IO.File]::ReadAllBytes((Join-Path $outProf.Dir 'credentials.json.enc'))) $outPass
+                if (-not (Test-CredText $chk)) {
+                    [void][System.Windows.Forms.MessageBox]::Show('口令不对，已跳过保鲜当前账号；下次切回它可能要重登。', '提示')
+                    $outProf = $null
+                }
+            }
+        }
+        if ($outProf) { Writeback-Current $name $outPass }
         Switch-To $name $pass
         Refresh-UI
         [void][System.Windows.Forms.MessageBox]::Show("已切换到 [$name]。`n请重新打开 Claude Code 会话以生效。", '完成')

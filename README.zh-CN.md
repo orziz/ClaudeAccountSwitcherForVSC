@@ -44,6 +44,8 @@ chmod +x claude-env-launcher.command claude-switch.command   # 仅首次
   - *保存当前账号为账号档* —— 把当前登录快照下来，供以后复用
 - **`claude-switch.command`** —— 原地切换默认账号
   - 切换会改写钥匙串，需**重启 claude / 新开 VS Code 窗口**才生效；已开着的会话不受影响。macOS 可能弹一次「允许访问」，点允许即可。
+  - **令牌自动保鲜**：登录令牌会过期、会轮换，所以切走某账号前，工具会把它**当前最新**的令牌回存进它的账号档（加密档会要一次该档口令）；这样下次切回来才不用重新登录。
+  - 首次用上这一特性时，旧账号档里还是过期令牌，**每个账号需先重新登录一次**来播下新令牌，之后即自动保鲜。
 
 若 macOS 拦截（「Apple 无法验证…」），那只是 Gatekeeper 对下载文件的隔离标记，**不是病毒**。解除：`xattr -d com.apple.quarantine claude-env-launcher.command`
 
@@ -53,11 +55,19 @@ chmod +x claude-env-launcher.command claude-switch.command   # 仅首次
 
 ## 合规性
 
-本工具**只用官方支持的机制**（`CLAUDE_CONFIG_DIR`、系统钥匙串、`code` 命令、标准 OAuth `/login`），不破解、不绕过、不规避任何东西。
+本工具**只用官方支持的机制**（`CLAUDE_CONFIG_DIR`、系统钥匙串、`code` 命令、标准 OAuth `/login`），不破解、不绕过、不规避任何东西——它只是帮你管理你本来就有的登录态。
 
-**你的用法是否合规，取决于一件事：每个账号都必须是你合法拥有或被授权使用、且各自独立付费/订阅的。** 这样用（自己的付费号、做自己的事），性质等同于浏览器开多个 Profile——没问题。
+**你的用法是否合规，取决于一件事：每个账号都必须是你合法拥有或被授权使用、各自独立付费订阅、且只有你本人在用。** 这样用（自己的付费号、做自己的事，比如工作号和个人号之间切换），性质等同于浏览器开多个 Profile。Anthropic 当前的 [使用政策](https://www.anthropic.com/legal/aup)（生效 2025-09-15）和 [Consumer Terms](https://www.anthropic.com/legal/consumer-terms)（生效 2025-10-08）里，**都没有**禁止一个人持有多个合法账号。
 
-**不可以**用它来叠加免费额度、用多个号绕过单订阅的用量上限、或把一个号共享/转卖给多人。请以 Anthropic 当前的 [使用政策](https://www.anthropic.com/legal/aup) 和服务条款为准。
+**硬线——明文禁止：**
+
+- **不要把账号凭据共享给别人。** Consumer Terms 原文：*"You may not share your Account login information, Anthropic API key, or Account credentials with anyone else."* 只在自己机器上管自己的号；绝不用它把一个号共享 / 转卖给多人。
+- **不要用别的账号绕过封禁**（使用政策）。
+- **不要跨账号协同滥用**以躲检测或绕过产品防护（使用政策）。
+
+**也别这么干：** 专门开多个号去绕过「单个 plan 的用量上限」、或叠加免费额度。条款里没逐字点名，但它踩在精神红线上——到量了的正道是买 extra usage credits / 升级 / 等额度重置。
+
+政策会更新，以上是对当前页面的解读——请以实时的 [使用政策](https://www.anthropic.com/legal/aup) 和 [Consumer Terms](https://www.anthropic.com/legal/consumer-terms) 为准。
 
 ## 安全 —— 务必读
 

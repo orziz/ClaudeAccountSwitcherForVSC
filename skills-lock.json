@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "odai": {
+      "source": "orziz/odai",
+      "sourceType": "github",
+      "skillPath": "skills/odai/SKILL.md",
+      "computedHash": "340cbe1d2eeb046d91bde3c30efbf2c4d97cac29e38837f04386d3a1acacbce0"
+    }
+  }
+}

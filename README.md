@@ -44,6 +44,8 @@ Then double-click:
   - *Save current account as profile* — snapshot your current login for reuse.
 - **`claude-switch.command`** — switch the default account in place.
   - Switching rewrites the Keychain; **restart Claude / open a new VS Code window** to take effect. Already-open sessions are unaffected. macOS may prompt once to allow access — click Allow.
+  - **Tokens stay fresh automatically**: login tokens expire and rotate, so before switching *away* from an account the tool writes that account's *current* token back into its profile (for an encrypted profile it asks for that profile's passphrase once). That's what lets you switch back later without re-logging in.
+  - The first time you use this: existing profiles still hold expired tokens, so **each account needs one re-login** to seed a fresh token; after that it stays fresh on its own.
 
 If macOS blocks the file ("Apple cannot verify…"), it's just Gatekeeper quarantine on a downloaded file, not malware. Clear it with: `xattr -d com.apple.quarantine claude-env-launcher.command`
 
@@ -53,11 +55,19 @@ Double-click the desktop shortcut or `launch.vbs`. `ClaudeEnvLauncher.ps1` is th
 
 ## Compliance
 
-This tool uses **only officially supported mechanisms** (`CLAUDE_CONFIG_DIR`, the OS keychain, the `code` CLI, standard OAuth `/login`). It does not crack, bypass, or circumvent anything.
+This tool uses **only officially supported mechanisms** (`CLAUDE_CONFIG_DIR`, the OS keychain, the `code` CLI, standard OAuth `/login`). It does not crack, bypass, or circumvent anything — it just manages logins you already have.
 
-Whether *your use* is compliant depends on one thing: **every account must be one you legitimately own or are authorized to use, each independently licensed/subscribed.** Used that way (your own paid accounts, for your own work), it's analogous to running multiple browser profiles — fine.
+Whether *your use* is compliant depends on one thing: **every account must be one you legitimately own or are authorized to use, each independently subscribed, and used only by you.** Used that way (your own paid accounts, for your own work, e.g. switching between a work and a personal account), it's analogous to running multiple browser profiles. Nothing in Anthropic's current [Usage Policy](https://www.anthropic.com/legal/aup) (eff. 2025-09-15) or [Consumer Terms](https://www.anthropic.com/legal/consumer-terms) (eff. 2025-10-08) prohibits one person holding multiple legitimate accounts.
 
-It is **not** acceptable to use it to multiply free-tier quota, to evade a single subscription's usage limits with extra accounts, or to share/resell one account across people. Always check Anthropic's current [Usage Policy](https://www.anthropic.com/legal/aup) and Terms.
+**Hard lines — explicitly against the terms:**
+
+- **Don't share account credentials with anyone else.** Consumer Terms: *"You may not share your Account login information, Anthropic API key, or Account credentials with anyone else."* Keep this to your own accounts on your own machine; never use it to share or resell one account across people.
+- **Don't evade a ban** by switching to a different account (Usage Policy).
+- **Don't coordinate abuse across accounts** to dodge detection or product guardrails (Usage Policy).
+
+**Don't do this either:** spinning up extra accounts specifically to get around a single plan's usage limits, or to multiply free-tier quota. It isn't quoted word-for-word in the terms, but it cuts against their intent — the supported path when you hit a limit is extra usage credits / upgrading / waiting for the reset.
+
+Policies change, and the above is a reading of the current pages — always check the live [Usage Policy](https://www.anthropic.com/legal/aup) and [Consumer Terms](https://www.anthropic.com/legal/consumer-terms) yourself.
 
 ## Security — read this
 

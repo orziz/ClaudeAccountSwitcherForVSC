@@ -74,7 +74,7 @@ EOF
 cur_cred()  { security find-generic-password -s "$KC_SVC" -w 2>/dev/null; }
 cur_oauth() { plutil -extract oauthAccount json -o - "$HOME_CLAUDE_JSON" 2>/dev/null; }
 cur_email() { plutil -extract oauthAccount.emailAddress raw -o - "$HOME_CLAUDE_JSON" 2>/dev/null; }
-prof_email(){ plutil -extract oauthAccount.emailAddress raw -o - "$1/oauthAccount.json" 2>/dev/null; }
+prof_email(){ plutil -extract emailAddress raw -o - "$1/oauthAccount.json" 2>/dev/null; }  # 档里的 oauthAccount.json 是内层对象，邮箱在顶层
 
 # ---------------- 账号档加密（openssl AES-256-CBC / PBKDF2-SHA256，口令保护）----------------
 # 格式与 Windows 端一致（openssl 标准 Salted__），跨平台可互解。
@@ -173,8 +173,49 @@ save_current() {  # 存当前默认账号为命名账号档（可加密）
   fi
 }
 
+# 把令牌/oauth 写进账号档：加密档用口令重新加密、明文档直接覆盖（用于切走前保鲜）
+writeback_to() {  # $1=pdir $2=cred $3=oauth $4=口令(加密档必填)
+  if [ -f "$1/credentials.json.enc" ]; then
+    [ -z "$4" ] && return 1
+    local tmp tenc; tmp="$(mktemp)"; tenc="$(mktemp)"; print -r -- "$2" > "$tmp"
+    enc_to "$tmp" "$tenc" "$4"; local rc=$?; rm -f "$tmp"
+    [ $rc -ne 0 ] && { rm -f "$tenc"; return 1; }
+    mv "$tenc" "$1/credentials.json.enc"; chmod 600 "$1/credentials.json.enc"
+  elif [ -f "$1/credentials.json" ]; then
+    print -r -- "$2" > "$1/credentials.json"; chmod 600 "$1/credentials.json"
+  else
+    return 1
+  fi
+  [ -n "$3" ] && print -r -- "$3" > "$1/oauthAccount.json"
+  return 0
+}
+
+# 切走前：把当前默认账号的最新令牌回写进它自己的命名档，防止下次切回时令牌已轮换作废而要重登
+writeback_current() {  # $1=即将切到的档名（排除，避免自写自）
+  local cur_c cur_e cur_o
+  cur_c="$(cur_cred)"; [ -z "$cur_c" ] && return 0
+  cur_e="$(cur_email)"; [ -z "$cur_e" ] && return 0
+  cur_o="$(cur_oauth)"
+  local pd match=""
+  for pd in "$PROFILES"/*(/N); do
+    [ "${pd:t}" = "$1" ] && continue
+    [ "$(prof_email "$pd")" = "$cur_e" ] && { match="$pd"; break; }
+  done
+  [ -z "$match" ] && return 0
+  if [ -f "$match/credentials.json.enc" ]; then
+    local pp; pp="$(ask_pass "为保鲜当前账号【$cur_e】，输入它账号档的口令。
+取消＝跳过；跳过则下次切回它可能要重新登录。")"
+    [ -z "$pp" ] && return 0
+    valid_cred "$(dec_cat "$match/credentials.json.enc" "$pp")" || { msg "口令不对，已跳过保鲜【$cur_e】；下次切回它可能要重新登录。"; return 0; }
+    writeback_to "$match" "$cur_c" "$cur_o" "$pp" || msg "保鲜【$cur_e】失败，已跳过。"
+  else
+    writeback_to "$match" "$cur_c" "$cur_o"
+  fi
+}
+
 switch_to() {  # $1=profile名：写回默认登录态
   local pdir="$PROFILES/$1"
+  writeback_current "$1"                            # 切走前先把当前账号最新令牌回写它自己的档（保鲜）
   local cred; cred="$(read_profile_cred "$pdir")"
   [ -z "$cred" ] && { msg "账号档【$1】不完整，或口令错误。"; return; }
   backup_current                                   # 先备份当前（令牌进钥匙串，无明文）
@@ -188,6 +229,26 @@ switch_to() {  # $1=profile名：写回默认登录态
 请重启 claude / 新开 VSCode 窗口生效；已开着的会话不受影响。
 首次访问若弹「允许 claude 读取钥匙串」，点允许即可。"
 }
+
+# ---------------- 自检（无需 GUI）: ./claude-switch.command --selftest ----------------
+if [ "$1" = "--selftest" ]; then
+  tmp="$(mktemp -d)"; ok=1
+  t1='{"claudeAiOauth":{"accessToken":"T1","refreshToken":"R1"}}'
+  t2='{"claudeAiOauth":{"accessToken":"T2","refreshToken":"R2"}}'
+  o='{"emailAddress":"a@b.com"}'
+  # 加密档：存 T1 → 模拟轮换重新加密为 T2 → 解出应含 T2/R2；错口令应被拦
+  pe="$tmp/enc"; mkdir -p "$pe"; tf="$(mktemp)"; print -r -- "$t1" > "$tf"
+  enc_to "$tf" "$pe/credentials.json.enc" "pw"; rm -f "$tf"; print -r -- "$o" > "$pe/oauthAccount.json"
+  writeback_to "$pe" "$t2" "$o" "pw"
+  case "$(dec_cat "$pe/credentials.json.enc" "pw")" in (*T2*R2*) ;; (*) ok=0 ;; esac
+  valid_cred "$(dec_cat "$pe/credentials.json.enc" "wrong")" && ok=0
+  # 明文档：写回直接覆盖为 T2
+  pp="$tmp/plain"; mkdir -p "$pp"; print -r -- "$t1" > "$pp/credentials.json"
+  writeback_to "$pp" "$t2" "$o"
+  case "$(cat "$pp/credentials.json")" in (*T2*) ;; (*) ok=0 ;; esac
+  rm -rf "$tmp"
+  [ $ok -eq 1 ] && { echo "SELFTEST PASS"; exit 0; } || { echo "SELFTEST FAIL"; exit 1; }
+fi
 
 # ---------------- 主循环 ----------------
 while true; do
